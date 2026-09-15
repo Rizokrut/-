@@ -23,6 +23,15 @@ from aiogram.types import (
 import database as db
 from config import ADMIN_ID, BOT_TOKEN, CHANNEL_ID, CHANNEL_URL
 
+
+def channel_chat_id():
+    raw = str(CHANNEL_ID or "").strip()
+    if raw.startswith("-") and raw[1:].isdigit():
+        return int(raw)
+    if raw.isdigit():
+        return int(raw)
+    return raw
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -31,7 +40,8 @@ router = Router()
 MUTE_SEC = 300
 STREAK_NEED = 6
 GAP_RESET = 5
-MENU = {"💬 Сплетни", "📜 Правила", "↩️ Ответить"}
+MENU = {"💬 Сплетни", "📜 Правила", "↩️ Ответить", "👤 Админ"}
+ADMIN_TG = "https://t.me/gubkinhelp"
 
 # Любые ссылки, кроме одной ссылки на пост канала — для реплая.
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
@@ -53,7 +63,7 @@ def menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="💬 Сплетни"), KeyboardButton(text="📜 Правила")],
-            [KeyboardButton(text="↩️ Ответить")],
+            [KeyboardButton(text="↩️ Ответить"), KeyboardButton(text="👤 Админ")],
         ],
         resize_keyboard=True,
     )
@@ -109,7 +119,7 @@ def _desc_with_n(desc: str | None, n: int) -> str:
 
 async def load_counter(bot: Bot) -> None:
     try:
-        chat = await bot.get_chat(CHANNEL_ID)
+        chat = await bot.get_chat(channel_chat_id())
         desc = getattr(chat, "description", None) or ""
         match = MARKER.search(desc)
         if match:
@@ -124,9 +134,9 @@ async def next_number(bot: Bot) -> int:
     _counter["n"] = int(_counter["n"] or 0) + 1
     n = _counter["n"]
     try:
-        chat = await bot.get_chat(CHANNEL_ID)
+        chat = await bot.get_chat(channel_chat_id())
         desc = getattr(chat, "description", None) or ""
-        await bot.set_chat_description(CHANNEL_ID, _desc_with_n(desc, n))
+        await bot.set_chat_description(channel_chat_id(), _desc_with_n(desc, n))
     except Exception:
         logger.exception("save_counter")
     return n
@@ -134,8 +144,13 @@ async def next_number(bot: Bot) -> int:
 
 async def is_member(bot: Bot, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ("member", "administrator", "creator")
+        member = await bot.get_chat_member(channel_chat_id(), user_id)
+        return member.status in (
+            "member",
+            "administrator",
+            "creator",
+            "restricted",
+        )
     except Exception:
         logger.exception("get_chat_member")
         return False
@@ -164,6 +179,8 @@ async def flood_ok(message: Message) -> bool:
 
 
 async def gate(message: Message) -> bool:
+    if message.from_user.id == ADMIN_ID:
+        return True
     if not await is_member(message.bot, message.from_user.id):
         await message.answer(
             "📢 Сначала подпишись на канал со сплетнями.",
@@ -237,13 +254,24 @@ async def reply_got_fwd(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     cid, mid = _forward_channel_id(message)
-    if cid == str(CHANNEL_ID) and mid:
+    if cid and str(cid) == str(channel_chat_id()) and mid:
         await state.update_data(reply_to=mid)
         await state.set_state(Flow.reply_wait_text)
         await message.answer("✍️ Пиши текст ответа.")
         return
     await state.clear()
     await publish_text(message)
+
+
+@router.message(F.text == "👤 Админ")
+async def admin_link(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Написать @gubkinhelp", url=ADMIN_TG)]
+        ]
+    )
+    await message.answer("Связь с админом:", reply_markup=kb)
 
 
 @router.message(F.text == "💬 Сплетни")
@@ -278,7 +306,7 @@ async def publish_text(message: Message, reply_to: int | None = None) -> None:
     try:
         n = await next_number(message.bot)
         await message.bot.send_message(
-            CHANNEL_ID,
+            channel_chat_id(),
             format_post(body, n),
             reply_to_message_id=reply_to,
         )
@@ -352,7 +380,7 @@ async def media_mod(callback: CallbackQuery) -> None:
     try:
         n = await next_number(callback.bot)
         await callback.bot.copy_message(
-            chat_id=CHANNEL_ID,
+            chat_id=channel_chat_id(),
             from_chat_id=item["chat_id"],
             message_id=item["message_id"],
             caption=format_post(item.get("caption") or "", n),
