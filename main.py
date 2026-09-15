@@ -1,4 +1,4 @@
-import asyncio
+import html
 import logging
 import re
 import time
@@ -29,10 +29,8 @@ router = Router()
 
 RATE_SEC = 15
 NICK_DAYS = 30
-LINK_RE = re.compile(
-    r"(https?://|www\.|t\.me/|telegram\.me/)",
-    re.IGNORECASE,
-)
+MENU = {"Сплетни", "Правила", "Ответить на пост", "Сменить ник"}
+LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
 NICK_RE = re.compile(r"^[0-9A-Za-zА-Яа-яЁё_\-]{1,15}$")
 
 pending_media: dict[str, dict] = {}
@@ -40,7 +38,6 @@ pending_media: dict[str, dict] = {}
 
 class Flow(StatesGroup):
     nick = State()
-    gossip = State()
     reply_wait_fwd = State()
     reply_wait_text = State()
 
@@ -63,6 +60,43 @@ def sub_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def format_post(text: str, nick: str) -> str:
+    body = html.escape((text or "").strip())
+    name = html.escape(nick)
+    sign = f"(с) <b>{name}</b>"
+    if body:
+        return f"{body}\n\n{sign}"
+    return sign
+
+
+def has_link(text: str | None) -> bool:
+    return bool(text and LINK_RE.search(text))
+
+
+def parse_changed(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    raw = str(raw).replace(" ", "T", 1)
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw[:26], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def nick_wait_days(user: dict | None) -> int | None:
+    if not user or not user.get("nick"):
+        return None
+    changed = parse_changed(user.get("nick_changed_at"))
+    if not changed:
+        return None
+    passed = datetime.utcnow() - changed
+    if passed < timedelta(days=NICK_DAYS):
+        return max(1, NICK_DAYS - passed.days)
+    return None
+
+
 async def is_member(bot: Bot, user_id: int) -> bool:
     try:
         m = await bot.get_chat_member(CHANNEL_ID, user_id)
@@ -75,20 +109,18 @@ async def is_member(bot: Bot, user_id: int) -> bool:
 async def gate(message: Message) -> bool:
     if not await is_member(message.bot, message.from_user.id):
         await message.answer(
-            "Сначала подпишись на канал со сплетнями.",
+            "📢 Сначала подпишись на канал со сплетнями.",
             reply_markup=sub_kb(),
         )
         return False
     return True
 
 
-def has_link(text: str | None) -> bool:
-    return bool(text and LINK_RE.search(text))
-
-
-def format_post(text: str, nick: str) -> str:
-    body = (text or "").strip()
-    return f"{body}\n\n[{nick}]"
+async def last_ok(message: Message) -> bool:
+    last = await db.last_sent(message.from_user.id)
+    if last is not None and time.time() - last < RATE_SEC:
+        return False
+    return True
 
 
 @router.message(CommandStart())
@@ -100,17 +132,14 @@ async def start(message: Message, state: FSMContext) -> None:
     if not user or not user.get("nick"):
         await state.set_state(Flow.nick)
         await message.answer(
-            "Придумай ник до 15 символов.\nБуквы, цифры, _ и -.\nМенять можно раз в 30 дней."
+            "👋 Придумай ник — до 15 символов.\nБуквы, цифры, _ и -.\nМенять можно раз в 30 дней."
         )
         return
-    await message.answer(
-        f"Ник: [{user['nick']}]\nЖми «Сплетни» или просто напиши текст.",
-        reply_markup=menu_kb(),
-    )
+    await message.answer("Готово. Можешь писать 👇", reply_markup=menu_kb())
 
 
 @router.callback_query(F.data == "chk")
-async def check_sub(callback: CallbackQuery, state: FSMContext) -> None:
+async def check_sub(callback: CallbackQuery) -> None:
     if await is_member(callback.bot, callback.from_user.id):
         await callback.message.answer("Подписка ок. /start")
         await callback.answer()
@@ -118,41 +147,16 @@ async def check_sub(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("Ещё не подписан", show_alert=True)
 
 
-@router.message(Flow.nick)
-async def save_nick(message: Message, state: FSMContext) -> None:
-    if not await gate(message):
-        return
-    raw = (message.text or "").strip()
-    if not NICK_RE.fullmatch(raw):
-        await message.answer("Ник 1–15 символов: буквы, цифры, _ -")
-        return
-    old = await db.get_user(message.from_user.id)
-    if old and old.get("nick") and old.get("nick_changed_at"):
-        try:
-            changed = datetime.fromisoformat(str(old["nick_changed_at"]).replace(" ", "T"))
-            if datetime.utcnow() - changed < timedelta(days=NICK_DAYS):
-                left = NICK_DAYS - (datetime.utcnow() - changed).days
-                await message.answer(f"Ник можно сменить через ~{left} дн.")
-                await state.clear()
-                return
-        except Exception:
-            pass
-    await db.set_nick(message.from_user.id, raw)
-    await state.clear()
-    await message.answer(f"Ник сохранён: [{raw}]", reply_markup=menu_kb())
-
-
 @router.message(F.text == "Правила")
-async def rules(message: Message) -> None:
+async def rules(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(
-        "Правила\n"
-        "• подписка на канал обязательна\n"
-        "• ник до 15 символов, смена раз в 30 дней\n"
-        "• одно сообщение в 15 секунд\n"
-        "• стикеры нельзя\n"
-        "• ссылки нельзя\n"
-        "• фото/видео уходят админу на проверку\n"
-        "• ответ на пост: кнопка → перешли пост боту → напиши текст"
+        "📜 <b>Правила</b>\n"
+        "1. Запрещено оскорблять студентов, администрацию и преподавательский состав филиала (по возможности)\n"
+        "2. Нельзя флудить/спамить\n"
+        "3. Запрещена реклама\n"
+        "4. Запрещается обращаться к администрации канала, чтобы узнать автора сообщения\n\n"
+        "Нарушение этих правил (в особенности 1 и 2) может привести к пожизненному бану."
     )
 
 
@@ -160,8 +164,37 @@ async def rules(message: Message) -> None:
 async def change_nick(message: Message, state: FSMContext) -> None:
     if not await gate(message):
         return
+    user = await db.get_user(message.from_user.id)
+    left = nick_wait_days(user)
+    if left:
+        await state.clear()
+        await message.answer(f"⏳ Ник можно сменить через {left} дн.")
+        return
     await state.set_state(Flow.nick)
-    await message.answer("Новый ник:")
+    await message.answer("✏️ Новый ник, до 15 символов:")
+
+
+@router.message(Flow.nick)
+async def save_nick(message: Message, state: FSMContext) -> None:
+    if not await gate(message):
+        return
+    if message.text in MENU:
+        await state.clear()
+        await message.answer("Отмена", reply_markup=menu_kb())
+        return
+    user = await db.get_user(message.from_user.id)
+    left = nick_wait_days(user)
+    if left:
+        await state.clear()
+        await message.answer(f"⏳ Ник можно сменить через {left} дн.", reply_markup=menu_kb())
+        return
+    raw = (message.text or "").strip()
+    if not NICK_RE.fullmatch(raw):
+        await message.answer("⚠️ Ник 1–15 символов: буквы, цифры, _ -")
+        return
+    await db.set_nick(message.from_user.id, raw)
+    await state.clear()
+    await message.answer(f"✅ Ник сохранён: <b>{html.escape(raw)}</b>", reply_markup=menu_kb())
 
 
 @router.message(F.text == "Ответить на пост")
@@ -173,56 +206,35 @@ async def reply_start(message: Message, state: FSMContext) -> None:
         await start(message, state)
         return
     await state.set_state(Flow.reply_wait_fwd)
-    await message.answer(
-        "Открой канал, перешли нужный пост сюда боту.\n"
-        "Потом напишешь текст ответа."
-    )
+    await message.answer("↩️ Перешли боту пост из канала.\nИли напиши текст — будет новый пост.")
 
 
-@router.message(Flow.reply_wait_fwd, F.text.in_({"Сплетни", "Правила", "Сменить ник", "Ответить на пост", "/start", "/cancel"}))
-async def reply_abort(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    if message.text == "Правила":
-        await rules(message)
-        return
-    if message.text == "Сменить ник":
-        await change_nick(message, state)
-        return
-    if message.text == "Ответить на пост":
-        await reply_start(message, state)
-        return
-    await message.answer("Ок, просто напиши текст — уйдёт новым постом.", reply_markup=menu_kb())
+def _forward_channel_id(message: Message) -> tuple[str | None, int | None]:
+    src = message.forward_from_chat
+    mid = message.forward_from_message_id
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None)
+        if chat is not None:
+            src = chat
+        mid = getattr(origin, "message_id", mid)
+    cid = str(src.id) if src else None
+    return cid, int(mid) if mid else None
 
 
 @router.message(Flow.reply_wait_fwd)
 async def reply_got_fwd(message: Message, state: FSMContext) -> None:
-    src = message.forward_from_chat
-    origin = getattr(message, "forward_origin", None)
-    if origin is not None and getattr(origin, "chat", None):
-        src = origin.chat
-    mid = message.forward_from_message_id
-    if origin is not None:
-        mid = getattr(origin, "message_id", mid)
-    chat_ok = bool(src and str(src.id) == str(CHANNEL_ID))
-    if not chat_ok or not mid:
+    if message.text in MENU:
         await state.clear()
-        if message.text and message.text not in {
-            "Сплетни", "Правила", "Сменить ник", "Ответить на пост"
-        }:
-            await text_msg(message, state)
-            return
-        await message.answer(
-            "Это не пост из канала. Напиши обычный текст — будет новый пост."
-        )
         return
-    await state.update_data(reply_to=int(mid))
-    await state.set_state(Flow.reply_wait_text)
-    await message.answer("Пиши текст ответа.")
-
-
-@router.message(F.sticker)
-async def no_stickers(message: Message) -> None:
-    await message.answer("Стикеры нельзя.")
+    cid, mid = _forward_channel_id(message)
+    if cid == str(CHANNEL_ID) and mid:
+        await state.update_data(reply_to=mid)
+        await state.set_state(Flow.reply_wait_text)
+        await message.answer("✍️ Пиши текст ответа.")
+        return
+    await state.clear()
+    await publish_text(message, reply_to=None)
 
 
 @router.message(F.text == "Сплетни")
@@ -233,40 +245,66 @@ async def gossip_hint(message: Message, state: FSMContext) -> None:
     if not user or not user.get("nick"):
         await start(message, state)
         return
-    await state.set_state(Flow.gossip)
-    await message.answer("Пиши текст. Он уйдёт в канал без твоего телеграм-имени.")
+    await state.clear()
+    await message.answer("✍️ Пиши текст — уйдёт в канал анонимно.")
 
 
-def _too_fast(last: float | None) -> bool:
-    if last is None:
-        return False
-    return time.time() - last < RATE_SEC
+@router.message(F.sticker)
+async def no_stickers(message: Message) -> None:
+    await message.answer("🚫 Стикеры нельзя.")
 
 
-async def ensure_ready(message: Message, state: FSMContext) -> dict | None:
+async def publish_text(message: Message, reply_to: int | None) -> None:
     if not await gate(message):
-        return None
+        return
     user = await db.get_user(message.from_user.id)
     if not user or not user.get("nick"):
-        await start(message, state)
-        return None
-    last = await db.last_sent(message.from_user.id)
-    if _too_fast(last):
-        wait = RATE_SEC - int(time.time() - (last or 0))
-        await message.answer(f"Подожди ещё {max(1, wait)} сек.")
-        return None
-    return user
+        return
+    if not await last_ok(message):
+        return
+    text = message.text or message.caption or ""
+    if has_link(text):
+        await message.answer("🚫 Ссылки нельзя.")
+        return
+    try:
+        await message.bot.send_message(
+            CHANNEL_ID,
+            format_post(text, user["nick"]),
+            reply_to_message_id=reply_to,
+        )
+        await db.touch_sent(message.from_user.id)
+    except Exception:
+        logger.exception("send channel")
+        await message.answer("⚠️ Не отправилось. Проверь, что бот админ канала.")
+
+
+@router.message(Flow.reply_wait_text, F.text)
+async def reply_text(message: Message, state: FSMContext) -> None:
+    if message.text in MENU:
+        await state.clear()
+        return
+    data = await state.get_data()
+    await state.clear()
+    await publish_text(message, reply_to=data.get("reply_to"))
 
 
 @router.message(F.photo | F.video | F.animation | F.document | F.voice | F.video_note)
 async def media_msg(message: Message, state: FSMContext) -> None:
-    user = await ensure_ready(message, state)
-    if not user:
+    if not await gate(message):
         return
-    caption = message.caption or message.text or ""
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("nick"):
+        await start(message, state)
+        return
+    if not await last_ok(message):
+        return
+    caption = message.caption or ""
     if has_link(caption):
-        await message.answer("Ссылки нельзя.")
+        await message.answer("🚫 Ссылки нельзя.")
         return
+    data = await state.get_data()
+    reply_to = data.get("reply_to")
+    await state.clear()
     key = f"{message.from_user.id}:{message.message_id}"
     pending_media[key] = {
         "user_id": message.from_user.id,
@@ -274,7 +312,7 @@ async def media_msg(message: Message, state: FSMContext) -> None:
         "chat_id": message.chat.id,
         "message_id": message.message_id,
         "caption": caption,
-        "reply_to": (await state.get_data()).get("reply_to"),
+        "reply_to": reply_to,
     }
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -284,16 +322,13 @@ async def media_msg(message: Message, state: FSMContext) -> None:
             ]
         ]
     )
-    await message.bot.copy_message(
-        ADMIN_ID, message.chat.id, message.message_id
-    )
+    await message.bot.copy_message(ADMIN_ID, message.chat.id, message.message_id)
     await message.bot.send_message(
         ADMIN_ID,
-        f"Медиа на проверку\nник [{user['nick']}]\nid {message.from_user.id}",
+        f"Медиа на проверку\nник {html.escape(user['nick'])}\nid {message.from_user.id}",
         reply_markup=kb,
     )
-    await message.answer("Медиа ушло админу. Если ок — появится в канале.")
-    await state.set_state(None)
+    await message.answer("🛡 Медиафайл ушёл на ручную модерацию.")
 
 
 @router.callback_query(F.data.startswith("m:"))
@@ -307,62 +342,33 @@ async def media_mod(callback: CallbackQuery) -> None:
         await callback.answer("Уже разобрано")
         return
     if decision == "no":
-        await callback.message.answer("Отклонено")
-        try:
-            await callback.bot.send_message(item["user_id"], "Медиа не пропустили.")
-        except Exception:
-            pass
-        await callback.answer()
+        await callback.answer("Нет")
         return
-    text = format_post(item.get("caption") or " ", item["nick"])
-    kwargs = {"chat_id": CHANNEL_ID, "from_chat_id": item["chat_id"], "message_id": item["message_id"]}
-    if item.get("reply_to"):
-        kwargs["reply_to_message_id"] = item["reply_to"]
+    caption = format_post(item.get("caption") or "", item["nick"])
     try:
-        await callback.bot.copy_message(**kwargs)
-        # caption overwrite not in copy_message easily; send extra text reply
-        await callback.bot.send_message(
-            CHANNEL_ID,
-            text,
+        await callback.bot.copy_message(
+            chat_id=CHANNEL_ID,
+            from_chat_id=item["chat_id"],
+            message_id=item["message_id"],
+            caption=caption,
             reply_to_message_id=item.get("reply_to"),
         )
         await db.touch_sent(item["user_id"])
-        await callback.bot.send_message(item["user_id"], "Опубликовано.")
     except Exception:
         logger.exception("publish media")
-        await callback.message.answer("Не смог запостить. Бот админ канала?")
+        await callback.message.answer("Не смог запостить в канал")
     await callback.answer()
 
 
 @router.message(F.text)
 async def text_msg(message: Message, state: FSMContext) -> None:
-    if message.text in {"Сплетни", "Правила", "Ответить на пост", "Сменить ник"}:
+    if message.text in MENU:
         return
     st = await state.get_state()
     if st == Flow.nick.state:
         return
-    user = await ensure_ready(message, state)
-    if not user:
-        return
-    if has_link(message.text):
-        await message.answer("Ссылки нельзя.")
-        return
-    data = await state.get_data()
-    reply_to = data.get("reply_to") if st == Flow.reply_wait_text.state else None
-    text = format_post(message.text, user["nick"])
-    try:
-        await message.bot.send_message(
-            CHANNEL_ID,
-            text,
-            reply_to_message_id=reply_to,
-        )
-    except Exception:
-        logger.exception("send channel")
-        await message.answer("Не отправилось в канал. Проверь, что бот админ.")
-        return
-    await db.touch_sent(message.from_user.id)
     await state.clear()
-    await message.answer("Ушло в канал.", reply_markup=menu_kb())
+    await publish_text(message, reply_to=None)
 
 
 async def main() -> None:
@@ -375,4 +381,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    import asyncio
+
     asyncio.run(main())
