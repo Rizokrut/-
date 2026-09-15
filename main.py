@@ -190,6 +190,12 @@ async def gate(message: Message) -> bool:
     return True
 
 
+
+def _from_our_channel(message: Message) -> bool:
+    cid, mid = _forward_channel_id(message)
+    return bool(cid and str(cid) == str(channel_chat_id()) and mid)
+
+
 def _forward_channel_id(message: Message) -> tuple[str | None, int | None]:
     src = message.forward_from_chat
     mid = message.forward_from_message_id
@@ -306,11 +312,12 @@ async def publish_text(message: Message, reply_to: int | None = None) -> None:
         return
     try:
         n = await next_number(message.bot)
-        await message.bot.send_message(
+        sent = await message.bot.send_message(
             channel_chat_id(),
             format_post(body, n),
             reply_to_message_id=reply_to,
         )
+        await db.save_post(sent.message_id, message.from_user.id)
     except Exception:
         logger.exception("send channel")
         await message.answer("⚠️ Не отправилось. Проверь, что бот админ канала.")
@@ -324,6 +331,33 @@ async def reply_text(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
     await publish_text(message, reply_to=data.get("reply_to"))
+
+
+@router.message(_from_our_channel)
+async def channel_forward_to_reply(message: Message, state: FSMContext) -> None:
+    if message.text in MENU:
+        await state.clear()
+        return
+    if not await gate(message):
+        return
+    cid, mid = _forward_channel_id(message)
+    if message.from_user.id == ADMIN_ID and mid:
+        uid = await db.get_post_author(mid)
+        if uid:
+            try:
+                chat = await message.bot.get_chat(uid)
+                name = html.escape(chat.full_name or chat.first_name or "—")
+                nick = f" @{chat.username}" if chat.username else ""
+                who = f"{name}{nick}\n<code>{uid}</code>"
+            except Exception:
+                who = f"<code>{uid}</code>"
+            await message.answer(f"🤫 Автор:\n{who}")
+        else:
+            await message.answer("🤫 Автора нет в базе (пост был до записи).")
+        return
+    await state.update_data(reply_to=mid)
+    await state.set_state(Flow.reply_wait_text)
+    await message.answer("✍️ Пиши текст ответа.")
 
 
 @router.message(F.photo | F.video | F.animation | F.document | F.voice | F.video_note)
@@ -380,13 +414,14 @@ async def media_mod(callback: CallbackQuery) -> None:
         return
     try:
         n = await next_number(callback.bot)
-        await callback.bot.copy_message(
+        sent = await callback.bot.copy_message(
             chat_id=channel_chat_id(),
             from_chat_id=item["chat_id"],
             message_id=item["message_id"],
             caption=format_post(item.get("caption") or "", n),
             reply_to_message_id=item.get("reply_to"),
         )
+        await db.save_post(sent.message_id, item["user_id"])
     except Exception:
         logger.exception("publish media")
         await callback.message.answer("Не смог запостить в канал")

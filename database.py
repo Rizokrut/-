@@ -31,6 +31,15 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE rate ADD COLUMN streak INTEGER DEFAULT 0")
         if "muted_until" not in cols:
             await db.execute("ALTER TABLE rate ADD COLUMN muted_until REAL DEFAULT 0")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS posts (
+                channel_msg_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT
+            )
+            """
+        )
         await db.commit()
 
 
@@ -91,3 +100,24 @@ async def set_rate(
             (telegram_id, last_sent_at, streak, muted_until),
         )
         await db.commit()
+
+async def save_post(channel_msg_id: int, user_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO posts (channel_msg_id, user_id, created_at)
+            VALUES (?, ?, datetime('now'))
+            """,
+            (channel_msg_id, user_id),
+        )
+        await db.commit()
+
+
+async def get_post_author(channel_msg_id: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id FROM posts WHERE channel_msg_id = ?",
+            (channel_msg_id,),
+        )
+        row = await cur.fetchone()
+        return int(row[0]) if row else None
