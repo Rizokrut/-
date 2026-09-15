@@ -179,22 +179,41 @@ async def reply_start(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.message(Flow.reply_wait_fwd, F.text.in_({"Сплетни", "Правила", "Сменить ник", "Ответить на пост", "/start", "/cancel"}))
+async def reply_abort(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    if message.text == "Правила":
+        await rules(message)
+        return
+    if message.text == "Сменить ник":
+        await change_nick(message, state)
+        return
+    if message.text == "Ответить на пост":
+        await reply_start(message, state)
+        return
+    await message.answer("Ок, просто напиши текст — уйдёт новым постом.", reply_markup=menu_kb())
+
+
 @router.message(Flow.reply_wait_fwd)
 async def reply_got_fwd(message: Message, state: FSMContext) -> None:
-    src = message.forward_from_chat or (
-        message.forward_origin.chat
-        if getattr(message, "forward_origin", None) is not None
-        and getattr(message.forward_origin, "chat", None)
-        else None
-    )
+    src = message.forward_from_chat
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None and getattr(origin, "chat", None):
+        src = origin.chat
     mid = message.forward_from_message_id
-    if getattr(message, "forward_origin", None) is not None:
-        mid = getattr(message.forward_origin, "message_id", mid)
-    chat_ok = False
-    if src and str(src.id) == str(CHANNEL_ID):
-        chat_ok = True
+    if origin is not None:
+        mid = getattr(origin, "message_id", mid)
+    chat_ok = bool(src and str(src.id) == str(CHANNEL_ID))
     if not chat_ok or not mid:
-        await message.answer("Нужен пересланный пост именно из канала сплетен.")
+        await state.clear()
+        if message.text and message.text not in {
+            "Сплетни", "Правила", "Сменить ник", "Ответить на пост"
+        }:
+            await text_msg(message, state)
+            return
+        await message.answer(
+            "Это не пост из канала. Напиши обычный текст — будет новый пост."
+        )
         return
     await state.update_data(reply_to=int(mid))
     await state.set_state(Flow.reply_wait_text)
