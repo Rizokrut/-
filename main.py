@@ -31,7 +31,7 @@ router = Router()
 MUTE_SEC = 300
 STREAK_NEED = 6
 GAP_RESET = 5
-MENU = {"Сплетни", "Правила", "Ответить на пост"}
+MENU = {"💬 Сплетни", "📜 Правила", "↩️ Ответить"}
 
 # Любые ссылки, кроме одной ссылки на пост канала — для реплая.
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
@@ -52,8 +52,8 @@ class Flow(StatesGroup):
 def menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Сплетни"), KeyboardButton(text="Правила")],
-            [KeyboardButton(text="Ответить на пост")],
+            [KeyboardButton(text="💬 Сплетни"), KeyboardButton(text="📜 Правила")],
+            [KeyboardButton(text="↩️ Ответить")],
         ],
         resize_keyboard=True,
     )
@@ -71,7 +71,7 @@ def sub_kb() -> InlineKeyboardMarkup:
 
 def format_post(text: str, number: int | str) -> str:
     body = html.escape((text or "").strip())
-    sign = f"№ {number}"
+    sign = f"<b>№{number}</b>"
     if body:
         return f"{body}\n{sign}"
     return sign
@@ -207,7 +207,7 @@ async def check_sub(callback: CallbackQuery) -> None:
     await callback.answer("Ещё не подписан", show_alert=True)
 
 
-@router.message(F.text == "Правила")
+@router.message(F.text == "📜 Правила")
 async def rules(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
@@ -220,7 +220,7 @@ async def rules(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(F.text == "Ответить на пост")
+@router.message(F.text == "↩️ Ответить")
 async def reply_start(message: Message, state: FSMContext) -> None:
     if not await gate(message):
         return
@@ -246,7 +246,7 @@ async def reply_got_fwd(message: Message, state: FSMContext) -> None:
     await publish_text(message)
 
 
-@router.message(F.text == "Сплетни")
+@router.message(F.text == "💬 Сплетни")
 async def gossip_hint(message: Message, state: FSMContext) -> None:
     if not await gate(message):
         return
