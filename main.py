@@ -209,7 +209,8 @@ async def start(message: Message, state: FSMContext) -> None:
     if not await gate(message):
         return
     await message.answer(
-        "Пиши текст — уйдёт в канал анонимно.\n"
+        "<b>🤫 Отправляй 100% анонимные сообщения.</b>\n\n"
+        "Бот автоматически закинет в канал.\n"
         "Ответ на пост: кинь ссылку на сообщение и текст в одном сообщении.",
         reply_markup=menu_kb(),
     )
@@ -218,7 +219,7 @@ async def start(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "chk")
 async def check_sub(callback: CallbackQuery) -> None:
     if await is_member(callback.bot, callback.from_user.id):
-        await callback.message.answer("Подписка ок. /start", reply_markup=menu_kb())
+        await callback.message.answer("Подписан, свой. /start", reply_markup=menu_kb())
         await callback.answer()
         return
     await callback.answer("Ещё не подписан", show_alert=True)
