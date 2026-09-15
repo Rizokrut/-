@@ -20,10 +20,17 @@ async def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS rate (
                 telegram_id INTEGER PRIMARY KEY,
-                last_sent_at REAL
+                last_sent_at REAL,
+                streak INTEGER DEFAULT 0,
+                muted_until REAL DEFAULT 0
             )
             """
         )
+        cols = {r[1] for r in await (await db.execute("PRAGMA table_info(rate)")).fetchall()}
+        if "streak" not in cols:
+            await db.execute("ALTER TABLE rate ADD COLUMN streak INTEGER DEFAULT 0")
+        if "muted_until" not in cols:
+            await db.execute("ALTER TABLE rate ADD COLUMN muted_until REAL DEFAULT 0")
         await db.commit()
 
 
@@ -52,25 +59,35 @@ async def set_nick(telegram_id: int, nick: str) -> None:
         await db.commit()
 
 
-async def last_sent(telegram_id: int) -> float | None:
+async def get_rate(telegram_id: int) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT last_sent_at FROM rate WHERE telegram_id = ?",
+            "SELECT last_sent_at, streak, muted_until FROM rate WHERE telegram_id = ?",
             (telegram_id,),
         )
         row = await cur.fetchone()
-        return float(row[0]) if row else None
+        if not row:
+            return {"last_sent_at": None, "streak": 0, "muted_until": 0}
+        return dict(row)
 
 
-async def touch_sent(telegram_id: int) -> None:
+async def set_rate(
+    telegram_id: int,
+    last_sent_at: float,
+    streak: int,
+    muted_until: float,
+) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO rate (telegram_id, last_sent_at)
-            VALUES (?, strftime('%s','now'))
+            INSERT INTO rate (telegram_id, last_sent_at, streak, muted_until)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
-                last_sent_at = strftime('%s','now')
+                last_sent_at = excluded.last_sent_at,
+                streak = excluded.streak,
+                muted_until = excluded.muted_until
             """,
-            (telegram_id,),
+            (telegram_id, last_sent_at, streak, muted_until),
         )
         await db.commit()

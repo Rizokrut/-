@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-RATE_SEC = 15
+MUTE_SEC = 300
+STREAK_NEED = 6
+GAP_RESET = 5
 NICK_DAYS = 30
 MENU = {"Сплетни", "Правила", "Ответить на пост", "Сменить ник"}
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
@@ -65,7 +67,7 @@ def format_post(text: str, nick: str) -> str:
     name = html.escape(nick)
     sign = f"(с) <b>{name}</b>"
     if body:
-        return f"{body}\n\n{sign}"
+        return f"{body}\n{sign}"
     return sign
 
 
@@ -106,19 +108,39 @@ async def is_member(bot: Bot, user_id: int) -> bool:
         return False
 
 
+
+async def flood_ok(message: Message) -> bool:
+    now = time.time()
+    rate = await db.get_rate(message.from_user.id)
+    muted = float(rate.get("muted_until") or 0)
+    if muted > now:
+        left = int(muted - now)
+        mins = max(1, left // 60)
+        sec = left % 60
+        await message.answer(f"🔇 Мут ещё {mins} мин {sec} сек.")
+        return False
+    last = rate.get("last_sent_at")
+    streak = int(rate.get("streak") or 0)
+    if last and now - float(last) >= GAP_RESET:
+        streak = 0
+    streak += 1
+    muted_until = 0.0
+    if streak >= STREAK_NEED:
+        muted_until = now + MUTE_SEC
+        streak = 0
+        await db.set_rate(message.from_user.id, now, streak, muted_until)
+        await message.answer("🔇 Слишком часто. Мут на 5 минут.")
+        return False
+    await db.set_rate(message.from_user.id, now, streak, 0)
+    return True
+
+
 async def gate(message: Message) -> bool:
     if not await is_member(message.bot, message.from_user.id):
         await message.answer(
             "📢 Сначала подпишись на канал со сплетнями.",
             reply_markup=sub_kb(),
         )
-        return False
-    return True
-
-
-async def last_ok(message: Message) -> bool:
-    last = await db.last_sent(message.from_user.id)
-    if last is not None and time.time() - last < RATE_SEC:
         return False
     return True
 
@@ -260,7 +282,7 @@ async def publish_text(message: Message, reply_to: int | None) -> None:
     user = await db.get_user(message.from_user.id)
     if not user or not user.get("nick"):
         return
-    if not await last_ok(message):
+    if not await flood_ok(message):
         return
     text = message.text or message.caption or ""
     if has_link(text):
@@ -272,7 +294,6 @@ async def publish_text(message: Message, reply_to: int | None) -> None:
             format_post(text, user["nick"]),
             reply_to_message_id=reply_to,
         )
-        await db.touch_sent(message.from_user.id)
     except Exception:
         logger.exception("send channel")
         await message.answer("⚠️ Не отправилось. Проверь, что бот админ канала.")
@@ -296,7 +317,7 @@ async def media_msg(message: Message, state: FSMContext) -> None:
     if not user or not user.get("nick"):
         await start(message, state)
         return
-    if not await last_ok(message):
+    if not await flood_ok(message):
         return
     caption = message.caption or ""
     if has_link(caption):
@@ -353,7 +374,7 @@ async def media_mod(callback: CallbackQuery) -> None:
             caption=caption,
             reply_to_message_id=item.get("reply_to"),
         )
-        await db.touch_sent(item["user_id"])
+        await db.set_rate(item["user_id"], time.time(), 0, 0)
     except Exception:
         logger.exception("publish media")
         await callback.message.answer("Не смог запостить в канал")
