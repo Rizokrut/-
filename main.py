@@ -1,9 +1,11 @@
 import html
+import os
 import logging
 import re
 import time
 from datetime import datetime, timedelta
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandStart
@@ -392,8 +394,24 @@ async def text_msg(message: Message, state: FSMContext) -> None:
     await publish_text(message, reply_to=None)
 
 
+
+async def handle_health(request):
+    return web.Response(text="ok")
+
+
+async def run_health_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
 async def main() -> None:
     await db.init_db()
+    await run_health_server()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
