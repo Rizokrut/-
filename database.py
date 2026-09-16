@@ -20,13 +20,20 @@ async def init_db() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 nick TEXT,
                 nick_changed_at TEXT,
-                last_seen_at TEXT
+                last_seen_at TEXT,
+                last_nick TEXT
             )
             """
         )
         ucols = {r[1] for r in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
         if "last_seen_at" not in ucols:
             await db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
+        if "last_nick" not in ucols:
+            await db.execute("ALTER TABLE users ADD COLUMN last_nick TEXT")
+            # перенос текущих ников в last_nick
+            await db.execute(
+                "UPDATE users SET last_nick = nick WHERE nick IS NOT NULL AND nick != ''"
+            )
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS rate (
@@ -215,30 +222,60 @@ async def get_nick(telegram_id: int) -> str | None:
     return nick or None
 
 
-async def set_nick(telegram_id: int, nick: str) -> None:
+async def get_last_nick(telegram_id: int) -> str | None:
+    user = await get_user(telegram_id)
+    if not user:
+        return None
+    last = (user.get("last_nick") or "").strip()
+    return last or None
+
+
+async def set_nick(telegram_id: int, nick: str, *, bump_changed: bool = True) -> None:
+    """
+    nick — активный ник.
+    last_nick всегда = nick (последний установленный).
+    nick_changed_at обновляется только если bump_changed=True (смена на другой).
+    """
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO users (telegram_id, nick, nick_changed_at)
-            VALUES (?, ?, datetime('now'))
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                nick = excluded.nick,
-                nick_changed_at = excluded.nick_changed_at
-            """,
-            (telegram_id, nick),
-        )
+        if bump_changed:
+            await db.execute(
+                """
+                INSERT INTO users (telegram_id, nick, last_nick, nick_changed_at, last_seen_at)
+                VALUES (?, ?, ?, datetime('now'), datetime('now'))
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    nick = excluded.nick,
+                    last_nick = excluded.last_nick,
+                    nick_changed_at = excluded.nick_changed_at,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (telegram_id, nick, nick),
+            )
+        else:
+            # вернуть тот же ник — таймер смены не трогаем
+            await db.execute(
+                """
+                INSERT INTO users (telegram_id, nick, last_nick, last_seen_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    nick = excluded.nick,
+                    last_nick = excluded.last_nick,
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (telegram_id, nick, nick),
+            )
         await db.commit()
 
 
 async def clear_nick(telegram_id: int) -> None:
+    """Снять активный ник. last_nick и nick_changed_at сохраняем (анти-обход кулдауна)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO users (telegram_id, nick, nick_changed_at)
+            INSERT INTO users (telegram_id, nick, last_seen_at)
             VALUES (?, NULL, datetime('now'))
             ON CONFLICT(telegram_id) DO UPDATE SET
                 nick = NULL,
-                nick_changed_at = excluded.nick_changed_at
+                last_seen_at = excluded.last_seen_at
             """,
             (telegram_id,),
         )

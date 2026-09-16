@@ -93,7 +93,8 @@ TG_POST_RE = re.compile(
     re.IGNORECASE,
 )
 # ник: буквы (лат/кир), цифры, _ - пробел; без ссылок
-NICK_RE = re.compile(r"^[\w\s\-]+$", re.UNICODE)
+# только буквы и цифры (лат/кир), без пробелов, _ и -
+NICK_RE = re.compile(r"^[^\W_]{2,20}$", re.UNICODE)
 
 pending_media: dict[str, dict] = {}
 _counter = {"n": 0, "msg_id": None}
@@ -312,9 +313,29 @@ def validate_nick(raw: str) -> str | None:
         return None
     if has_forbidden_links(nick):
         return None
-    # убрать лишние пробелы
-    nick = re.sub(r"\s+", " ", nick).strip()
     return nick
+
+
+def nick_delete_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить ник", callback_data="nick:del")]
+        ]
+    )
+
+
+def _nick_age_sec(user: dict | None) -> float | None:
+    """Секунд с последней смены ника (на другой), или None."""
+    if not user or not user.get("nick_changed_at"):
+        return None
+    try:
+        changed = datetime.fromisoformat(
+            str(user["nick_changed_at"]).replace(" ", "T")
+        )
+        return time.time() - changed.replace(tzinfo=None).timestamp()
+    except Exception:
+        logger.exception("nick age parse")
+        return None
 
 
 def is_night_hours() -> bool:
@@ -587,17 +608,38 @@ async def nick_start(message: Message, state: FSMContext) -> None:
     if current:
         text = (
             f"🎭 Твой ник сейчас: <b>(c) {html.escape(current)}</b>\n\n"
-            f"Пришли новый ник ({NICK_MIN}–{NICK_MAX} символов, буквы/цифры/_/-).\n"
-            "Или отправь <code>-</code> чтобы сбросить и снова показывать номер."
+            f"Пришли новый ник ({NICK_MIN}–{NICK_MAX} символов, буквы/цифры).\n"
+            "Сменить на другой — раз в сутки."
         )
-    else:
-        text = (
-            f"🎭 Ник не задан — в канале показывается номер.\n\n"
-            f"Пришли ник ({NICK_MIN}–{NICK_MAX} символов, буквы/цифры/_/-).\n"
-            "Вместо №N будет <b>(c) твой_ник</b>."
-        )
+        await state.set_state(Flow.set_nick)
+        await message.answer(text, reply_markup=nick_delete_kb())
+        return
+
+    text = (
+        "🎭 Ник не задан — в канале показывается номер.\n\n"
+        f"Пришли ник ({NICK_MIN}–{NICK_MAX} символов, буквы/цифры).\n"
+        "Вместо № будет <b>(c) твой ник</b>."
+    )
     await state.set_state(Flow.set_nick)
     await message.answer(text, reply_markup=menu_kb())
+
+
+@router.callback_query(F.data == "nick:del")
+async def nick_delete_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await db.clear_nick(callback.from_user.id)
+    await state.clear()
+    try:
+        await callback.message.edit_text(
+            "✅ Ник удалён. Снова будет нумерация.\n"
+            "Вернуть можно только тот же ник; другой — через сутки."
+        )
+    except Exception:
+        await callback.message.answer(
+            "✅ Ник удалён. Снова будет нумерация.\n"
+            "Вернуть можно только тот же ник; другой — через сутки.",
+            reply_markup=menu_kb(),
+        )
+    await callback.answer("Ник удалён")
 
 
 @router.message(Flow.set_nick, F.text)
@@ -608,48 +650,49 @@ async def nick_set(message: Message, state: FSMContext) -> None:
         return
 
     raw = (message.text or "").strip()
-    if raw == "-":
-        await db.clear_nick(message.from_user.id)
-        await state.clear()
-        await message.answer(
-            "✅ Ник сброшен. Снова будет нумерация.",
-            reply_markup=menu_kb(),
-        )
-        return
-
     nick = validate_nick(raw)
     if not nick:
         await message.answer(
             f"🚫 Ник не подходит.\n"
             f"• {NICK_MIN}–{NICK_MAX} символов\n"
-            "• только буквы, цифры, пробел, _ и -\n"
-            "• без ссылок и @"
+            "• только буквы и цифры"
         )
         return
 
-    # кулдаун смены ника
     user = await db.get_user(message.from_user.id)
-    if user and user.get("nick_changed_at") and user.get("nick"):
-        try:
-            # SQLite datetime('now') → UTC-ish string
-            changed = datetime.fromisoformat(
-                str(user["nick_changed_at"]).replace(" ", "T")
-            )
-            # считаем как naive UTC → сравниваем с time
-            age = time.time() - changed.replace(tzinfo=None).timestamp()
-            # если sqlite без timezone, fromisoformat может быть локальным;
-            # проще: ограничение «мягкое» — если строка есть и ник тот же, ок
-            if age < NICK_CHANGE_COOLDOWN_SEC and nick != (user.get("nick") or ""):
-                left = NICK_CHANGE_COOLDOWN_SEC - age
-                await message.answer(
-                    f"⏳ Ник можно менять раз в сутки.\n"
-                    f"Подожди ещё {fmt_left(left)}."
-                )
-                return
-        except Exception:
-            logger.exception("nick cooldown parse")
+    current = ((user or {}).get("nick") or "").strip()
+    last = ((user or {}).get("last_nick") or "").strip()
+    age = _nick_age_sec(user)
 
-    await db.set_nick(message.from_user.id, nick)
+    # уже стоит этот же — ок
+    if current and nick == current:
+        await state.clear()
+        await message.answer(
+            f"ℹ️ Ник уже <b>(c) {html.escape(nick)}</b>",
+            reply_markup=menu_kb(),
+        )
+        return
+
+    # восстановление того же ника после удаления — без сдвига таймера
+    if not current and last and nick == last:
+        await db.set_nick(message.from_user.id, nick, bump_changed=False)
+        await state.clear()
+        await message.answer(
+            f"✅ Ник снова: <b>(c) {html.escape(nick)}</b>",
+            reply_markup=menu_kb(),
+        )
+        return
+
+    # смена на другой (или первый раз после другого) — кулдаун
+    if last and nick != last and age is not None and age < NICK_CHANGE_COOLDOWN_SEC:
+        left = NICK_CHANGE_COOLDOWN_SEC - age
+        await message.answer(
+            f"⏳ Другой ник можно поставить через {fmt_left(left)}.\n"
+            + (f"Сейчас можно только: <b>{html.escape(last)}</b>" if last else "")
+        )
+        return
+
+    await db.set_nick(message.from_user.id, nick, bump_changed=True)
     await state.clear()
     await message.answer(
         f"✅ Ник установлен: <b>(c) {html.escape(nick)}</b>",
