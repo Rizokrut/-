@@ -1302,11 +1302,14 @@ async def channel_forward_to_reply(message: Message, state: FSMContext) -> None:
             try:
                 chat = await message.bot.get_chat(uid)
                 name = html.escape(chat.full_name or chat.first_name or "—")
-                nick = f" @{chat.username}" if chat.username else ""
-                who = f"{name}{nick}\n<code>{uid}</code>"
+                uname = f" @{chat.username}" if chat.username else ""
+                who = f"{name}{uname}\n<code>{uid}</code>"
             except Exception:
                 who = f"<code>{uid}</code>"
-            await message.answer(f"🤫 Автор:\n{who}")
+            await message.answer(
+                f"🤫 Автор:\n{who}\n\nВыдать мут:",
+                reply_markup=mute_duration_kb(uid),
+            )
         else:
             await message.answer("🤫 Автора нет в базе (пост был до записи).")
         return
