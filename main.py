@@ -206,6 +206,20 @@ def night_kb(enabled: bool) -> InlineKeyboardMarkup:
     )
 
 
+def mute_offer_kb(uid: int) -> InlineKeyboardMarkup:
+    """Одна кнопка — чтобы случайно не выдать мут."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⛔️ Закрыть рот",
+                    callback_data=f"mutemenu:{uid}",
+                )
+            ]
+        ]
+    )
+
+
 def mute_duration_kb(uid: int) -> InlineKeyboardMarkup:
     rows = []
     row = []
@@ -230,7 +244,7 @@ def mute_duration_kb(uid: int) -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append(
-        [InlineKeyboardButton(text="Отмена", callback_data="mute:cancel")]
+        [InlineKeyboardButton(text="Отмена", callback_data=f"mute:cancel:{uid}")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1019,6 +1033,26 @@ async def admin_mute_pick_text(message: Message, state: FSMContext) -> None:
     )
 
 
+@router.callback_query(F.data.startswith("mutemenu:"))
+async def admin_mute_menu(callback: CallbackQuery) -> None:
+    if not await db.is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    try:
+        uid = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.answer("Ошибка")
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=mute_duration_kb(uid))
+    except Exception:
+        await callback.message.answer(
+            f"Срок мута для <code>{uid}</code>:",
+            reply_markup=mute_duration_kb(uid),
+        )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("mute:"))
 async def admin_mute_do(callback: CallbackQuery, state: FSMContext) -> None:
     if not await db.is_admin(callback.from_user.id):
@@ -1030,8 +1064,27 @@ async def admin_mute_do(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if parts[1] == "cancel":
         await state.clear()
-        await callback.message.edit_text("Отменено.")
-        await callback.answer()
+        uid = None
+        if len(parts) >= 3:
+            try:
+                uid = int(parts[2])
+            except ValueError:
+                uid = None
+        try:
+            if uid is not None and callback.message.text and "Автор" in (
+                callback.message.text or ""
+            ):
+                await callback.message.edit_reply_markup(
+                    reply_markup=mute_offer_kb(uid)
+                )
+            elif uid is not None:
+                await callback.message.edit_text("Отменено.")
+            else:
+                await callback.message.edit_text("Отменено.")
+        except Exception:
+            await callback.answer("Отменено")
+            return
+        await callback.answer("Отменено")
         return
     if len(parts) != 3:
         await callback.answer("Ошибка")
@@ -1044,7 +1097,6 @@ async def admin_mute_do(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     if minutes == 0:
-        # «навсегда» — далеко в будущем (~10 лет)
         until = time.time() + 10 * 365 * 24 * 3600
         label = "навсегда (до снятия)"
     else:
@@ -1307,8 +1359,8 @@ async def channel_forward_to_reply(message: Message, state: FSMContext) -> None:
             except Exception:
                 who = f"<code>{uid}</code>"
             await message.answer(
-                f"🤫 Автор:\n{who}\n\nВыдать мут:",
-                reply_markup=mute_duration_kb(uid),
+                f"🤫 Автор:\n{who}",
+                reply_markup=mute_offer_kb(uid),
             )
         else:
             await message.answer("🤫 Автора нет в базе (пост был до записи).")
