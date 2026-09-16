@@ -40,7 +40,70 @@ async def init_db() -> None:
             )
             """
         )
+        # === АДМИНЫ ===
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                telegram_id INTEGER PRIMARY KEY
+            )
+            """
+        )
         await db.commit()
+
+
+async def ensure_main_admin(main_admin_id: int) -> None:
+    """Гарантирует, что главный ADMIN_ID из конфига всегда в таблице."""
+    if not main_admin_id:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)",
+            (main_admin_id,),
+        )
+        await db.commit()
+
+
+async def is_admin(telegram_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM admins WHERE telegram_id = ?", (telegram_id,)
+        )
+        return await cur.fetchone() is not None
+
+
+async def add_admin(telegram_id: int) -> bool:
+    """True если добавили, False если уже был."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)",
+            (telegram_id,),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def remove_admin(telegram_id: int, protect_id: int) -> str:
+    """
+    protect_id — главный админ, его нельзя удалить.
+    Возвращает: "ok" | "not_found" | "protected"
+    """
+    if telegram_id == protect_id:
+        return "protected"
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM admins WHERE telegram_id = ?", (telegram_id,)
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            return "not_found"
+        return "ok"
+
+
+async def list_admins() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT telegram_id FROM admins ORDER BY telegram_id")
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
 
 async def get_user(telegram_id: int) -> dict | None:
@@ -100,6 +163,7 @@ async def set_rate(
             (telegram_id, last_sent_at, streak, muted_until),
         )
         await db.commit()
+
 
 async def save_post(channel_msg_id: int, user_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
