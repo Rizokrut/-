@@ -19,10 +19,14 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id INTEGER PRIMARY KEY,
                 nick TEXT,
-                nick_changed_at TEXT
+                nick_changed_at TEXT,
+                last_seen_at TEXT
             )
             """
         )
+        ucols = {r[1] for r in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
+        if "last_seen_at" not in ucols:
+            await db.execute("ALTER TABLE users ADD COLUMN last_seen_at TEXT")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS rate (
@@ -76,14 +80,28 @@ async def init_db() -> None:
 
 
 async def get_setting(key: str, default: str = "") -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = await cur.fetchone()
-        return row[0] if row else default
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else default
+    except Exception:
+        # старая база без таблицы settings
+        return default
 
 
 async def set_setting(key: str, value: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         await db.execute(
             """
             INSERT INTO settings (key, value) VALUES (?, ?)
@@ -172,6 +190,21 @@ async def get_user(telegram_id: int) -> dict | None:
         )
         row = await cur.fetchone()
         return dict(row) if row else None
+
+
+async def touch_user(telegram_id: int) -> None:
+    """Зафиксировать, что юзер писал боту (для рассылки). Ник не трогаем."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO users (telegram_id, nick, nick_changed_at, last_seen_at)
+            VALUES (?, NULL, NULL, datetime('now'))
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                last_seen_at = datetime('now')
+            """,
+            (telegram_id,),
+        )
+        await db.commit()
 
 
 async def get_nick(telegram_id: int) -> str | None:
@@ -295,6 +328,42 @@ async def list_post_authors(limit: int = 40) -> list[int]:
         return [int(r[0]) for r in rows]
 
 
+async def list_all_post_authors() -> list[int]:
+    """Все уникальные авторы постов."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT user_id FROM posts
+            GROUP BY user_id
+            ORDER BY MAX(created_at) DESC
+            """
+        )
+        rows = await cur.fetchall()
+        return [int(r[0]) for r in rows]
+
+
+async def list_broadcast_recipients() -> list[int]:
+    """
+    Все, кому бот может попытаться написать:
+    — заходили в бота / писали (users)
+    — авторы постов
+    — есть запись в rate
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT telegram_id AS uid FROM users
+            UNION
+            SELECT user_id AS uid FROM posts
+            UNION
+            SELECT telegram_id AS uid FROM rate
+            ORDER BY uid
+            """
+        )
+        rows = await cur.fetchall()
+        return [int(r[0]) for r in rows]
+
+
 async def list_muted(now: float) -> list[tuple[int, float]]:
     """Список (user_id, muted_until) у кого сейчас активный мут."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -315,3 +384,5 @@ async def import_db_from_file(source_path: str | Path) -> None:
     if not source.exists():
         raise FileNotFoundError("Файл не найден")
     shutil.copy2(source, DB_FILE)
+    # после импорта старой базы — досоздать таблицы/дефолты
+    await init_db()

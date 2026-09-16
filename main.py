@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -63,6 +64,7 @@ ADMIN_MENU = {
     "🌙 Ночной режим",
     "🔇 Снять мут",
     "🚫 Дать мут",
+    "📢 Рассылка",
     "👥 Список админов",
     "➕ Добавить админа",
     "➖ Удалить админа",
@@ -70,6 +72,7 @@ ADMIN_MENU = {
     "📥 Импорт БД",
     "↩️ Назад",
 }
+ALL_BUTTONS = MENU | ADMIN_MENU
 ADMIN_TG = "https://t.me/gubkinhelp"
 
 # ссылки / кликабельное
@@ -105,6 +108,7 @@ class Flow(StatesGroup):
     admin_add = State()
     admin_remove = State()
     admin_import_db = State()
+    admin_broadcast = State()
     set_nick = State()
 
 
@@ -125,7 +129,7 @@ def admin_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⏱ Кулдаун")],
-            [KeyboardButton(text="🌙 Ночной режим")],
+            [KeyboardButton(text="🌙 Ночной режим"), KeyboardButton(text="📢 Рассылка")],
             [KeyboardButton(text="🚫 Дать мут"), KeyboardButton(text="🔇 Снять мут")],
             [KeyboardButton(text="👥 Список админов")],
             [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
@@ -144,6 +148,33 @@ def sub_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Проверить подписку", callback_data="chk")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _dispatch_menu(message: Message, state: FSMContext) -> None:
+    """Повторно обработать кнопку меню после выхода из FSM-состояния."""
+    text = message.text or ""
+    mapping = {
+        "💬 Сплетни": gossip_hint,
+        "📜 Правила": rules,
+        "↩️ Ответить": reply_start,
+        "🎭 Ник": nick_start,
+        "👤 Админ": admin_link,
+        "📊 Статистика": admin_stats,
+        "⏱ Кулдаун": admin_cooldown,
+        "🌙 Ночной режим": admin_night,
+        "🔇 Снять мут": admin_unmute_start,
+        "🚫 Дать мут": admin_mute_start,
+        "📢 Рассылка": admin_broadcast_start,
+        "👥 Список админов": admin_list,
+        "➕ Добавить админа": admin_add_start,
+        "➖ Удалить админа": admin_remove_start,
+        "💾 Экспорт БД": export_db,
+        "📥 Импорт БД": import_db_start,
+        "↩️ Назад": admin_back,
+    }
+    handler = mapping.get(text)
+    if handler:
+        await handler(message, state)
 
 
 def cooldown_kb(current: int) -> InlineKeyboardMarkup:
@@ -359,6 +390,10 @@ async def is_member(bot: Bot, user_id: int) -> bool:
 async def flood_ok(message: Message) -> bool:
     """Кулдаун + ночной режим + ручной мут. Админы без ограничений."""
     uid = message.from_user.id
+    try:
+        await db.touch_user(uid)
+    except Exception:
+        logger.exception("touch_user")
     if await db.is_admin(uid):
         return True
 
@@ -439,6 +474,10 @@ def _forward_channel_id(message: Message) -> tuple[str | None, int | None]:
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
+    try:
+        await db.touch_user(message.from_user.id)
+    except Exception:
+        logger.exception("touch_user start")
     if not await gate(message):
         return
     await message.answer(
@@ -485,8 +524,10 @@ async def reply_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Flow.reply_wait_fwd)
 async def reply_got_fwd(message: Message, state: FSMContext) -> None:
-    if message.text in MENU or message.text in ADMIN_MENU:
+    # кнопки меню обрабатывают свои хендлеры — только сбрасываем state
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     cid, mid = _forward_channel_id(message)
     if cid and str(cid) == str(channel_chat_id()) and mid:
@@ -501,14 +542,25 @@ async def reply_got_fwd(message: Message, state: FSMContext) -> None:
 @router.message(F.text == "👤 Админ")
 async def admin_link(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if await db.is_admin(message.from_user.id):
-        cd = await db.get_cooldown_min()
-        night = await db.get_night_mode()
+    try:
+        is_adm = await db.is_admin(message.from_user.id)
+    except Exception:
+        logger.exception("is_admin")
+        is_adm = message.from_user.id == ADMIN_ID
+
+    if is_adm:
+        try:
+            cd = await db.get_cooldown_min()
+            night = await db.get_night_mode()
+        except Exception:
+            logger.exception("admin settings")
+            cd, night = 1, True
         night_s = "вкл" if night else "выкл"
         await message.answer(
             "🛠 <b>Админ-меню</b>\n"
             f"• ⏱ Кулдаун: <b>{cd} мин</b>\n"
             f"• 🌙 Ночной режим: <b>{night_s}</b> (02:00–07:00 Ташкент, раз в 30 мин)\n"
+            "• 📢 Рассылка всем, кто писал в канал\n"
             "• 🚫 / 🔇 Дать / снять мут\n"
             "• 👥 / ➕ / ➖ Админы\n"
             "• 💾 / 📥 Экспорт и импорт базы\n"
@@ -550,8 +602,9 @@ async def nick_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Flow.set_nick, F.text)
 async def nick_set(message: Message, state: FSMContext) -> None:
-    if message.text in MENU or message.text in ADMIN_MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
 
     raw = (message.text or "").strip()
@@ -719,6 +772,84 @@ async def admin_night_toggle(callback: CallbackQuery) -> None:
     await callback.answer("Вкл" if new else "Выкл")
 
 
+# ─── админ: рассылка ──────────────────────────────────────────────────────────
+
+@router.message(F.text == "📢 Рассылка")
+async def admin_broadcast_start(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    recipients = await db.list_broadcast_recipients()
+    await state.set_state(Flow.admin_broadcast)
+    await message.answer(
+        f"📢 <b>Рассылка</b>\n"
+        f"Получателей в базе бота: <b>{len(recipients)}</b>\n\n"
+        "⚠️ Telegram <b>не даёт</b> боту список подписчиков канала.\n"
+        "Пишем тем, кто хотя бы раз открыл бота /start или отправил сплетню.\n\n"
+        "Пришли текст или медиа — уйдёт всем из базы.\n"
+        "Отмена — любая кнопка меню.",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(Flow.admin_broadcast)
+async def admin_broadcast_do(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text and message.text in ALL_BUTTONS:
+        await state.clear()
+        await _dispatch_menu(message, state)
+        return
+
+    recipients = await db.list_broadcast_recipients()
+    if not recipients:
+        await state.clear()
+        await message.answer(
+            "База пустая: никто ещё не писал боту.\n"
+            "Список подписчиков канала через Bot API получить нельзя.\n"
+            "После /start у юзеров они появятся в рассылке.\n"
+            "Сохраняй БД через «💾 Экспорт БД» перед деплоем.",
+            reply_markup=admin_kb(),
+        )
+        return
+
+    await state.clear()
+    status_msg = await message.answer(
+        f"⏳ Рассылка на {len(recipients)} чел.…"
+    )
+
+    ok = 0
+    fail = 0
+    for i, uid in enumerate(recipients):
+        try:
+            await message.bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            ok += 1
+        except Exception:
+            fail += 1
+            logger.exception("broadcast to %s", uid)
+        if (i + 1) % 20 == 0:
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.05)
+
+    try:
+        await status_msg.edit_text(
+            f"✅ Рассылка завершена\n"
+            f"Успешно: <b>{ok}</b>\n"
+            f"Не доставлено: <b>{fail}</b>\n"
+            f"(блок бота / нет диалога / удалили чат)"
+        )
+    except Exception:
+        await message.answer(
+            f"✅ Рассылка: ок {ok}, ошибок {fail}",
+            reply_markup=admin_kb(),
+        )
+
+
 # ─── админ: мут / размут ──────────────────────────────────────────────────────
 
 @router.message(F.text == "🔇 Снять мут")
@@ -746,8 +877,9 @@ async def admin_unmute_do(message: Message, state: FSMContext) -> None:
     if not await db.is_admin(message.from_user.id):
         await state.clear()
         return
-    if message.text in ADMIN_MENU or message.text in MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     try:
         uid = int(message.text.strip())
@@ -827,8 +959,9 @@ async def admin_mute_pick_text(message: Message, state: FSMContext) -> None:
     if not await db.is_admin(message.from_user.id):
         await state.clear()
         return
-    if message.text in ADMIN_MENU or message.text in MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     try:
         uid = int(message.text.strip())
@@ -915,8 +1048,9 @@ async def admin_add_do(message: Message, state: FSMContext) -> None:
     if not await db.is_admin(message.from_user.id):
         await state.clear()
         return
-    if message.text in ADMIN_MENU or message.text in MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     try:
         uid = int(message.text.strip())
@@ -948,8 +1082,9 @@ async def admin_remove_do(message: Message, state: FSMContext) -> None:
     if not await db.is_admin(message.from_user.id):
         await state.clear()
         return
-    if message.text in ADMIN_MENU or message.text in MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     try:
         uid = int(message.text.strip())
@@ -1100,8 +1235,9 @@ async def publish_text(message: Message, reply_to: int | None = None) -> None:
 
 @router.message(Flow.reply_wait_text, F.text)
 async def reply_text(message: Message, state: FSMContext) -> None:
-    if message.text in MENU or message.text in ADMIN_MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     data = await state.get_data()
     await state.clear()
@@ -1110,8 +1246,9 @@ async def reply_text(message: Message, state: FSMContext) -> None:
 
 @router.message(_from_our_channel)
 async def channel_forward_to_reply(message: Message, state: FSMContext) -> None:
-    if message.text in MENU or message.text in ADMIN_MENU:
+    if message.text and message.text in ALL_BUTTONS:
         await state.clear()
+        await _dispatch_menu(message, state)
         return
     if not await gate(message):
         return
@@ -1214,7 +1351,7 @@ async def media_mod(callback: CallbackQuery) -> None:
 
 @router.message(F.text)
 async def text_msg(message: Message, state: FSMContext) -> None:
-    if message.text in MENU or message.text in ADMIN_MENU:
+    if message.text and message.text in ALL_BUTTONS:
         return
     await state.clear()
     await publish_text(message)
