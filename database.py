@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import aiosqlite
+import shutil
+from pathlib import Path
 
 DB_PATH = "gossip.db"
+DB_FILE = Path(DB_PATH)
 
 
 async def init_db() -> None:
@@ -40,7 +43,6 @@ async def init_db() -> None:
             )
             """
         )
-        # === АДМИНЫ ===
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS admins (
@@ -52,7 +54,6 @@ async def init_db() -> None:
 
 
 async def ensure_main_admin(main_admin_id: int) -> None:
-    """Гарантирует, что главный ADMIN_ID из конфига всегда в таблице."""
     if not main_admin_id:
         return
     async with aiosqlite.connect(DB_PATH) as db:
@@ -72,7 +73,6 @@ async def is_admin(telegram_id: int) -> bool:
 
 
 async def add_admin(telegram_id: int) -> bool:
-    """True если добавили, False если уже был."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT OR IGNORE INTO admins (telegram_id) VALUES (?)",
@@ -83,10 +83,6 @@ async def add_admin(telegram_id: int) -> bool:
 
 
 async def remove_admin(telegram_id: int, protect_id: int) -> str:
-    """
-    protect_id — главный админ, его нельзя удалить.
-    Возвращает: "ok" | "not_found" | "protected"
-    """
     if telegram_id == protect_id:
         return "protected"
     async with aiosqlite.connect(DB_PATH) as db:
@@ -185,3 +181,14 @@ async def get_post_author(channel_msg_id: int) -> int | None:
         )
         row = await cur.fetchone()
         return int(row[0]) if row else None
+
+
+async def export_db_path() -> Path:
+    return DB_FILE
+
+
+async def import_db_from_file(source_path: str | Path) -> None:
+    source = Path(source_path)
+    if not source.exists():
+        raise FileNotFoundError("Файл не найден")
+    shutil.copy2(source, DB_FILE)
