@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import time
+import tempfile
+from pathlib import Path
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -13,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -48,6 +51,8 @@ ADMIN_MENU = {
     "👥 Список админов",
     "➕ Добавить админа",
     "➖ Удалить админа",
+    "💾 Экспорт БД",
+    "📥 Импорт БД",
     "↩️ Назад",
 }
 ADMIN_TG = "https://t.me/gubkinhelp"
@@ -68,6 +73,7 @@ class Flow(StatesGroup):
     admin_unmute = State()
     admin_add = State()
     admin_remove = State()
+    admin_import_db = State()
 
 
 def menu_kb() -> ReplyKeyboardMarkup:
@@ -86,6 +92,7 @@ def admin_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔇 Снять мут")],
             [KeyboardButton(text="👥 Список админов")],
             [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
+            [KeyboardButton(text="💾 Экспорт БД"), KeyboardButton(text="📥 Импорт БД")],
             [KeyboardButton(text="↩️ Назад")],
         ],
         resize_keyboard=True,
@@ -302,6 +309,7 @@ async def admin_link(message: Message, state: FSMContext) -> None:
             "• 🔇 Снять мут\n"
             "• 👥 Список админов\n"
             "• ➕ / ➖ Управление админами\n"
+            "• 💾 / 📥 Экспорт и импорт базы\n"
             "• ↩️ Назад",
             reply_markup=admin_kb(),
         )
@@ -449,6 +457,73 @@ async def admin_remove_do(message: Message, state: FSMContext) -> None:
         await message.answer(f"ℹ️ <code>{uid}</code> не найден в списке админов", reply_markup=admin_kb())
 
 
+@router.message(F.text == "💾 Экспорт БД")
+@router.message(Command("export_db"))
+async def export_db(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.clear()
+
+    db_path = await db.export_db_path()
+    if not db_path.exists():
+        await message.answer("База ещё не создана")
+        return
+
+    try:
+        file = FSInputFile(db_path, filename="gossip.db")
+        await message.answer_document(
+            file,
+            caption=(
+                "💾 Актуальная база данных\n\n"
+                "Сохрани этот файл.\n"
+                "После деплоя отправь его боту через кнопку «📥 Импорт БД»"
+            ),
+        )
+    except Exception:
+        logger.exception("export_db")
+        await message.answer("Не удалось отправить файл")
+
+
+@router.message(F.text == "📥 Импорт БД")
+@router.message(Command("import_db"))
+async def import_db_start(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.set_state(Flow.admin_import_db)
+    await message.answer(
+        "📥 Пришли файл <code>gossip.db</code> как документ.\n"
+        "Текущая база будет полностью заменена.",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(Flow.admin_import_db, F.document)
+async def import_db_do(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    doc = message.document
+    if not (doc.file_name and doc.file_name.lower().endswith(".db")):
+        await message.answer("Нужен файл с расширением .db")
+        return
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            await message.bot.download(doc, destination=tmp.name)
+            tmp_path = tmp.name
+
+        await db.import_db_from_file(tmp_path)
+        os.unlink(tmp_path)
+
+        await state.clear()
+        await message.answer("✅ База успешно импортирована!", reply_markup=admin_kb())
+    except Exception:
+        logger.exception("import_db")
+        await message.answer("❌ Ошибка при импорте базы")
+        await state.clear()
+
+
 @router.message(F.text == "↩️ Назад")
 async def admin_back(message: Message, state: FSMContext) -> None:
     if not await db.is_admin(message.from_user.id):
@@ -566,7 +641,6 @@ async def media_msg(message: Message, state: FSMContext) -> None:
             ]
         ]
     )
-    # Отправляем модерацию всем админам (или хотя бы главному)
     for admin_id in await db.list_admins():
         try:
             await message.bot.copy_message(admin_id, message.chat.id, message.message_id)
@@ -633,7 +707,7 @@ async def run_health_server() -> None:
 
 async def main() -> None:
     await db.init_db()
-    await db.ensure_main_admin(ADMIN_ID)  # главный админ всегда есть
+    await db.ensure_main_admin(ADMIN_ID)
     await run_health_server()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     await load_counter(bot)
