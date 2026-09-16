@@ -32,6 +32,7 @@ def channel_chat_id():
         return int(raw)
     return raw
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,16 @@ MUTE_SEC = 300
 STREAK_NEED = 6
 GAP_RESET = 5
 MENU = {"💬 Сплетни", "📜 Правила", "↩️ Ответить", "👤 Админ"}
+ADMIN_MENU = {
+    "📊 Статистика",
+    "🔇 Снять мут",
+    "👥 Список админов",
+    "➕ Добавить админа",
+    "➖ Удалить админа",
+    "↩️ Назад",
+}
 ADMIN_TG = "https://t.me/gubkinhelp"
 
-# Любые ссылки, кроме одной ссылки на пост канала — для реплая.
 LINK_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
 TG_POST_RE = re.compile(
     r"(https?://)?(t\.me|telegram\.me)/(c/\d+/|(?P<user>[A-Za-z0-9_]+)/)(?P<mid>\d+)",
@@ -57,6 +65,9 @@ _counter = {"n": 0, "msg_id": None}
 class Flow(StatesGroup):
     reply_wait_fwd = State()
     reply_wait_text = State()
+    admin_unmute = State()
+    admin_add = State()
+    admin_remove = State()
 
 
 def menu_kb() -> ReplyKeyboardMarkup:
@@ -64,6 +75,18 @@ def menu_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="💬 Сплетни"), KeyboardButton(text="📜 Правила")],
             [KeyboardButton(text="↩️ Ответить"), KeyboardButton(text="👤 Админ")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def admin_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔇 Снять мут")],
+            [KeyboardButton(text="👥 Список админов")],
+            [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
+            [KeyboardButton(text="↩️ Назад")],
         ],
         resize_keyboard=True,
     )
@@ -179,7 +202,7 @@ async def flood_ok(message: Message) -> bool:
 
 
 async def gate(message: Message) -> bool:
-    if message.from_user.id == ADMIN_ID:
+    if await db.is_admin(message.from_user.id):
         return True
     if not await is_member(message.bot, message.from_user.id):
         await message.answer(
@@ -188,7 +211,6 @@ async def gate(message: Message) -> bool:
         )
         return False
     return True
-
 
 
 def _from_our_channel(message: Message) -> bool:
@@ -257,7 +279,7 @@ async def reply_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Flow.reply_wait_fwd)
 async def reply_got_fwd(message: Message, state: FSMContext) -> None:
-    if message.text in MENU:
+    if message.text in MENU or message.text in ADMIN_MENU:
         await state.clear()
         return
     cid, mid = _forward_channel_id(message)
@@ -273,12 +295,166 @@ async def reply_got_fwd(message: Message, state: FSMContext) -> None:
 @router.message(F.text == "👤 Админ")
 async def admin_link(message: Message, state: FSMContext) -> None:
     await state.clear()
+    if await db.is_admin(message.from_user.id):
+        await message.answer(
+            "🛠 <b>Админ-меню</b>\n"
+            "• 📊 Статистика\n"
+            "• 🔇 Снять мут\n"
+            "• 👥 Список админов\n"
+            "• ➕ / ➖ Управление админами\n"
+            "• ↩️ Назад",
+            reply_markup=admin_kb(),
+        )
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Написать @gubkinhelp", url=ADMIN_TG)]
         ]
     )
     await message.answer("Связь с админом:", reply_markup=kb)
+
+
+@router.message(F.text == "📊 Статистика")
+async def admin_stats(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.clear()
+    async with db.aiosqlite.connect(db.DB_PATH) as conn:
+        cur = await conn.execute("SELECT COUNT(*) FROM posts")
+        posts_count = (await cur.fetchone())[0]
+        cur = await conn.execute("SELECT COUNT(DISTINCT user_id) FROM posts")
+        authors_count = (await cur.fetchone())[0]
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM rate WHERE muted_until > ?", (time.time(),)
+        )
+        muted_count = (await cur.fetchone())[0]
+    await message.answer(
+        f"📊 <b>Статистика</b>\n"
+        f"Постов в базе: <b>{posts_count}</b>\n"
+        f"Уникальных авторов: <b>{authors_count}</b>\n"
+        f"Сейчас в муте: <b>{muted_count}</b>\n"
+        f"Текущий номер: <b>№{_counter['n']}</b>",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(F.text == "🔇 Снять мут")
+async def admin_unmute_start(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.set_state(Flow.admin_unmute)
+    await message.answer(
+        "Введи <code>telegram_id</code> пользователя, которому снять мут:",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(Flow.admin_unmute, F.text)
+async def admin_unmute_do(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text in ADMIN_MENU or message.text in MENU:
+        await state.clear()
+        return
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("Нужен числовой telegram_id.")
+        return
+    rate = await db.get_rate(uid)
+    await db.set_rate(uid, rate.get("last_sent_at") or 0, rate.get("streak") or 0, 0)
+    await state.clear()
+    await message.answer(f"✅ Мут снят у <code>{uid}</code>", reply_markup=admin_kb())
+
+
+@router.message(F.text == "👥 Список админов")
+async def admin_list(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.clear()
+    admins = await db.list_admins()
+    lines = []
+    for aid in admins:
+        mark = " (главный)" if aid == ADMIN_ID else ""
+        lines.append(f"• <code>{aid}</code>{mark}")
+    text = "👥 <b>Админы:</b>\n" + ("\n".join(lines) if lines else "пусто")
+    await message.answer(text, reply_markup=admin_kb())
+
+
+@router.message(F.text == "➕ Добавить админа")
+async def admin_add_start(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.set_state(Flow.admin_add)
+    await message.answer(
+        "Введи <code>telegram_id</code> нового админа:",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(Flow.admin_add, F.text)
+async def admin_add_do(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text in ADMIN_MENU or message.text in MENU:
+        await state.clear()
+        return
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("Нужен числовой telegram_id.")
+        return
+    added = await db.add_admin(uid)
+    await state.clear()
+    if added:
+        await message.answer(f"✅ Админ <code>{uid}</code> добавлен", reply_markup=admin_kb())
+    else:
+        await message.answer(f"ℹ️ <code>{uid}</code> уже админ", reply_markup=admin_kb())
+
+
+@router.message(F.text == "➖ Удалить админа")
+async def admin_remove_start(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.set_state(Flow.admin_remove)
+    await message.answer(
+        "Введи <code>telegram_id</code> админа, которого удалить\n"
+        f"(главного <code>{ADMIN_ID}</code> удалить нельзя):",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.message(Flow.admin_remove, F.text)
+async def admin_remove_do(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text in ADMIN_MENU or message.text in MENU:
+        await state.clear()
+        return
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("Нужен числовой telegram_id.")
+        return
+    result = await db.remove_admin(uid, protect_id=ADMIN_ID)
+    await state.clear()
+    if result == "ok":
+        await message.answer(f"✅ Админ <code>{uid}</code> удалён", reply_markup=admin_kb())
+    elif result == "protected":
+        await message.answer("🚫 Главного админа удалить нельзя", reply_markup=admin_kb())
+    else:
+        await message.answer(f"ℹ️ <code>{uid}</code> не найден в списке админов", reply_markup=admin_kb())
+
+
+@router.message(F.text == "↩️ Назад")
+async def admin_back(message: Message, state: FSMContext) -> None:
+    if not await db.is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("Обычное меню:", reply_markup=menu_kb())
 
 
 @router.message(F.text == "💬 Сплетни")
@@ -325,7 +501,7 @@ async def publish_text(message: Message, reply_to: int | None = None) -> None:
 
 @router.message(Flow.reply_wait_text, F.text)
 async def reply_text(message: Message, state: FSMContext) -> None:
-    if message.text in MENU:
+    if message.text in MENU or message.text in ADMIN_MENU:
         await state.clear()
         return
     data = await state.get_data()
@@ -335,13 +511,13 @@ async def reply_text(message: Message, state: FSMContext) -> None:
 
 @router.message(_from_our_channel)
 async def channel_forward_to_reply(message: Message, state: FSMContext) -> None:
-    if message.text in MENU:
+    if message.text in MENU or message.text in ADMIN_MENU:
         await state.clear()
         return
     if not await gate(message):
         return
     cid, mid = _forward_channel_id(message)
-    if message.from_user.id == ADMIN_ID and mid:
+    if await db.is_admin(message.from_user.id) and mid:
         uid = await db.get_post_author(mid)
         if uid:
             try:
@@ -390,18 +566,23 @@ async def media_msg(message: Message, state: FSMContext) -> None:
             ]
         ]
     )
-    await message.bot.copy_message(ADMIN_ID, message.chat.id, message.message_id)
-    await message.bot.send_message(
-        ADMIN_ID,
-        f"Медиа на проверку\nid {message.from_user.id}",
-        reply_markup=kb,
-    )
+    # Отправляем модерацию всем админам (или хотя бы главному)
+    for admin_id in await db.list_admins():
+        try:
+            await message.bot.copy_message(admin_id, message.chat.id, message.message_id)
+            await message.bot.send_message(
+                admin_id,
+                f"Медиа на проверку\nid {message.from_user.id}",
+                reply_markup=kb,
+            )
+        except Exception:
+            logger.exception("send media to admin %s", admin_id)
     await message.answer("🛡 Медиафайл ушёл на ручную модерацию.")
 
 
 @router.callback_query(F.data.startswith("m:"))
 async def media_mod(callback: CallbackQuery) -> None:
-    if callback.from_user.id != ADMIN_ID:
+    if not await db.is_admin(callback.from_user.id):
         await callback.answer()
         return
     _, decision, key = callback.data.split(":", 2)
@@ -430,7 +611,7 @@ async def media_mod(callback: CallbackQuery) -> None:
 
 @router.message(F.text)
 async def text_msg(message: Message, state: FSMContext) -> None:
-    if message.text in MENU:
+    if message.text in MENU or message.text in ADMIN_MENU:
         return
     await state.clear()
     await publish_text(message)
@@ -452,6 +633,7 @@ async def run_health_server() -> None:
 
 async def main() -> None:
     await db.init_db()
+    await db.ensure_main_admin(ADMIN_ID)  # главный админ всегда есть
     await run_health_server()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     await load_counter(bot)
